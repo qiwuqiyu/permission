@@ -14,6 +14,17 @@
         <el-table-column prop="id" label="ID" width="80" />
         <el-table-column prop="username" label="用户名" />
         <el-table-column prop="email" label="邮箱" />
+        <!-- 用户拥有的角色（后端只返回 role_ids 数组，名字在前端用角色列表映射） -->
+        <el-table-column label="角色" min-width="180">
+          <template #default="{ row }">
+            <template v-if="row.role_ids.length">
+              <el-tag v-for="rid in row.role_ids" :key="rid" size="small" type="success" class="role-tag">
+                {{ roleMap[rid] || '角色已删' }}
+              </el-tag>
+            </template>
+            <span v-else class="no-role">未分配</span>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="180">
           <!-- template + slot：拿到当前行 row，类比 v-for 里每一项的数据 -->
           <template #default="{ row }">
@@ -36,6 +47,15 @@
         <el-form-item label="邮箱" prop="email">
           <el-input v-model="form.email" placeholder="xxx@xx.com" />
         </el-form-item>
+        <!-- 角色多选框（一个用户可有多个角色，关系存在 user_roles 中间表） -->
+        <el-form-item label="角色" prop="role_ids">
+          <!-- multiple：v-model 绑的是数组，不是一个值 -->
+          <!-- collapse-tags：选得多时折叠成“管理员 +3”，避免把弹窗撑爆 -->
+          <el-select v-model="form.role_ids" placeholder="可多选，留空表示不分配" multiple clearable
+                     collapse-tags collapse-tags-tooltip style="width: 100%">
+            <el-option v-for="r in roles" :key="r.id" :label="r.name" :value="r.id" />
+          </el-select>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="modalShow = false">取消</el-button>
@@ -46,7 +66,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import request from '../utils/request'
 
@@ -57,11 +77,18 @@ const modalShow = ref(false)
 const isEdit = ref(false)
 const formRef = ref(null)
 
+// 角色列表：用于弹窗里的下拉选项 + 表格里的“id → 角色名”映射
+const roles = ref([])
+// 转成 { id: name } 的字典，表格每行取名字时 O(1)，比每行 find 一次轻
+// （computed 会在 roles 变化时自动重算，无需手动维护）
+const roleMap = computed(() => Object.fromEntries(roles.value.map((r) => [r.id, r.name])))
+
 const form = ref({
   id: null,
   username: '',
   password: '',
-  email: ''
+  email: '',
+  role_ids: []   // 角色 id 数组，[] = 一个角色都没分配
 })
 
 // 前端表单校验：用户名必填且不能是纯数字（和后端规则一致，双重保险）
@@ -88,17 +115,30 @@ const getList = async () => {
   }
 }
 
+// 获取角色下拉选项（不校验，拉不到也不能影响用户列表展示，单独 try 一下）
+const getRoles = async () => {
+  try {
+    const res = await request.get('/roles')
+    roles.value = res.data
+  } catch (e) {
+    roles.value = []
+  }
+}
+
 // 打开新增弹窗
 const openAddModal = () => {
   isEdit.value = false
-  form.value = { id: null, username: '', password: '', email: '' }
+  // 注意这里必须是全新的 []，不能复用同一个数组引用，否则删了再加会互相影响
+  form.value = { id: null, username: '', password: '', email: '', role_ids: [] }
   modalShow.value = true
 }
 
 // 打开编辑弹窗
 const openEditModal = (row) => {
   isEdit.value = true
-  form.value = { ...row } // 浅拷贝：避免直接改表格行数据（取消时不应污染列表）
+  // 浅拷贝只能拷一层，row.role_ids 这个数组仍是共享引用，
+  // 所以额外拷一份数组，保证“改一半就取消”不会污染表格里的数据
+  form.value = { ...row, role_ids: [...(row.role_ids || [])] }
   modalShow.value = true
 }
 
@@ -113,7 +153,8 @@ const submit = () => {
         await request.put(`/users/${form.value.id}`, {
           username: form.value.username,
           password: form.value.password,
-          email: form.value.email
+          email: form.value.email,
+          role_ids: form.value.role_ids || []   // 全部取消时可能是 undefined，归成 []（语义：清空绑定）
         })
         ElMessage.success('修改成功')
       } else {
@@ -121,7 +162,8 @@ const submit = () => {
         await request.post('/users', {
           username: form.value.username,
           password: form.value.password,
-          email: form.value.email
+          email: form.value.email,
+          role_ids: form.value.role_ids || []
         })
         ElMessage.success('新增成功')
       }
@@ -153,6 +195,7 @@ const handleDel = (row) => {
 // 页面加载自动拉取列表
 onMounted(() => {
   getList()
+  getRoles() // 角色选项也要拉（表格显示角色名靠它）
 })
 </script>
 
@@ -173,5 +216,14 @@ onMounted(() => {
 .table-box {
   flex: 1;
   overflow: hidden;
+}
+/* 未分配角色的置灰文字 */
+.no-role {
+  color: #bbb;
+  font-size: 13px;
+}
+/* 多个角色标签并排的间距 */
+.role-tag {
+  margin-right: 6px;
 }
 </style>

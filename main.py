@@ -8,7 +8,7 @@
 # ============================================================================
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import create_engine, Column, Integer, String, text
+from sqlalchemy import create_engine, Column, Integer, String, text, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -60,6 +60,8 @@ class DBUser(Base):
     username = Column(String(50), unique=True, index=True)  # 用户名，最长50字符，不能重复
     password = Column(String(100))                         # 密码（明文存储，仅demo演示）
     email = Column(String(100), unique=True, index=True)    # 邮箱，最长100字符，不能重复
+    # 注意：这里不再有 role_id 了！
+    # 用户和角色的关系改由下面的 user_roles 中间表维护（多对多，一个用户可有多个角色）
 
 # 菜单表：存左侧导航栏的菜单项 —— “菜单管理”页面增删改的就是这张表
 # 类比：以前菜单是硬编码在 Layout.vue 里的数组，现在搬进数据库，改数据就能改导航
@@ -80,9 +82,63 @@ class DBRole(Base):
     name = Column(String(50), unique=True, index=True)     # 角色名，如“管理员”，不能重复
     description = Column(String(200))                      # 角色描述，备注用
 
+# 角色 ↔ 菜单 关联表（多对多）：一个角色能看多个菜单，一个菜单也能开放给多个角色
+# 多对多关系没法靠“在某一侧加一列”解决，必须单独建一张「中间表」，里面只放两个外键
+# （下面 user_roles 也是同一类中间表，两个多对多关系各一张，结构完全对称）
+class DBRoleMenu(Base):
+    __tablename__ = "role_menus"
+
+    id = Column(Integer, primary_key=True, index=True)                      # 关联记录ID
+    role_id = Column(Integer, ForeignKey("roles.id"), index=True)           # 哪个角色
+    menu_id = Column(Integer, ForeignKey("menus.id"), index=True)           # 能访问哪个菜单
+
+# 用户 ↔ 角色 关联表（多对多）：一个用户可以身兼多个角色（比如既是“运营”又是“客服”）
+# 和上面 role_menus 是同一个套路，只要关系是多对多，就必须拆一张只放两个外键的中间表
+# 至此就是教科书上的经典 RBAC 五表：users / roles / menus / user_roles / role_menus
+class DBUserRole(Base):
+    __tablename__ = "user_roles"
+
+    id = Column(Integer, primary_key=True, index=True)                      # 关联记录ID
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)           # 哪个用户
+    role_id = Column(Integer, ForeignKey("roles.id"), index=True)           # 拥有哪个角色
+
 # 启动时自动建表（类似前端项目初始化时创建本地存储结构）
 # 只有表不存在时才会创建，已存在的表不会被改动
 Base.metadata.create_all(bind=engine)
+
+# ========== 1.5 轻量迁移：把旧的 users.role_id 升级为 user_roles 中间表 ==========
+# create_all() 只会「建新表」（user_roles 会自动建好），但它不会删旧列！
+# 而且不能简单一删了之：如果老库里 users.role_id 已经有值，直接 DROP COLUMN 就把数据弄丢了
+# 所以顺序必须是：先搬迁旧数据到中间表 -> 再删旧列（整段幂等，跑过一次就不会重复执行）
+with engine.connect() as conn:
+    has_role_id = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM information_schema.columns "
+            "WHERE table_schema = :db AND table_name = 'users' AND column_name = 'role_id'"
+        ),
+        {"db": MYSQL_DATABASE},
+    ).scalar()
+    if has_role_id:
+        # 第 1 步：把已有绑定的用户挑出来，灌进 user_roles（跳过重复，避免重跑时插两条）
+        legacy = conn.execute(
+            text("SELECT id, role_id FROM users WHERE role_id IS NOT NULL")
+        ).fetchall()
+        moved = 0
+        for uid, rid in legacy:
+            exists = conn.execute(
+                text("SELECT COUNT(*) FROM user_roles WHERE user_id = :u AND role_id = :r"),
+                {"u": uid, "r": rid},
+            ).scalar()
+            if not exists:
+                conn.execute(
+                    text("INSERT INTO user_roles (user_id, role_id) VALUES (:u, :r)"),
+                    {"u": uid, "r": rid},
+                )
+                moved += 1
+        # 第 2 步：数据安全落进中间表了，才删掉旧列（MySQL 删列会自动去掉上面的外键约束）
+        conn.execute(text("ALTER TABLE users DROP COLUMN role_id"))
+        conn.commit()
+        print(f"[迁移] 已将 users.role_id 迁入 user_roles（新增 {moved} 条）并删除旧列")
 
 # 首次运行时给菜单表种两条默认数据（表里没数据才插，防止重复）
 # 类比：前端 mock 数据兜底，保证页面第一次打开不至于空白
@@ -90,6 +146,13 @@ with SessionLocal() as db:
     if db.query(DBMenu).count() == 0:
         db.add(DBMenu(name="用户管理", path="/users", sort=1))
         db.add(DBMenu(name="菜单管理", path="/menus", sort=2))
+        db.commit()
+
+# 单独补「角色管理」菜单：按 path 判重（上面的 count==0 只在空表时触发，
+# 老库里已有两条菜单，不会再进那个分支，所以新页面的入口要这样幂等补上）
+with SessionLocal() as db:
+    if db.query(DBMenu).filter(DBMenu.path == "/roles").first() is None:
+        db.add(DBMenu(name="角色管理", path="/roles", sort=3))
         db.commit()
 
 # 角色表同样种两条默认数据（表里没数据才插）
@@ -109,6 +172,8 @@ class UserCreate(BaseModel):
     username: str   # 必填，必须是字符串
     password: str   # 必填，必须是字符串
     email: str      # 必填，必须是字符串
+    # 所属角色 id 列表（不再是单个 role_id）：空数组 = 一个角色都没分配
+    role_ids: list[int] = []
 
 # 局部更新模型：PATCH 时允许只传想改的字段（其他字段不传就保持原样）
 # `str | None = None` 相当于 TS 的 `username?: string`，不传就是 undefined
@@ -116,12 +181,17 @@ class UserUpdate(BaseModel):
     username: str | None = None
     password: str | None = None
     email: str | None = None
+    # 这里用 `| None = None` 而不是直接给 []，是为了区分两种完全不同的意图：
+    # None = 这次没动角色（保持原样）；[] = 明确要把角色全部清空
+    role_ids: list[int] | None = None
 
 # 响应模型：后端返回给前端的用户数据结构（在 UserCreate 基础上多了 id）
 class User(UserCreate):
     id: int  # 数据库生成的自增ID
     # Pydantic v2 写法：允许直接从数据库对象(DBUser)上读取属性来组装 JSON
     # （v1 的旧写法叫 orm_mode=True，改名了而已，作用相同）
+    # 注：role_ids 不存在 users 表上，要靠下面手工从 user_roles 查出来填，
+    #     所以 from_attributes 只能自动带出 username/email 这几列
     model_config = ConfigDict(from_attributes=True)
 
 # 菜单的出入参模型（结构比用户简单，套路完全一样）
@@ -156,6 +226,17 @@ class Role(RoleCreate):
     id: int
     model_config = ConfigDict(from_attributes=True)
 
+# 给角色分配菜单的请求体：{ "menu_ids": [1, 3] }
+# 语义是「全量覆盖」：传什么就是最终结果，传空数组 = 取消该角色全部菜单授权
+class RoleMenuAssign(BaseModel):
+    menu_ids: list[int] = []
+
+# 角色列表的响应模型：在 Role 基础上带上已授权的菜单
+# 这样前端拉一次 /roles 就能同时拿到表格展示 + 弹窗回显所需的数据，不用再单独查
+class RoleWithMenus(Role):
+    menu_ids: list[int] = []     # 已授权菜单 id，用于弹窗勾选回显
+    menu_names: list[str] = []   # 已授权菜单名，用于表格直接展示
+
 # ========== 4. FastAPI 实例 + 跨域配置 ==========
 # app = 后端应用实例，之后所有的接口都"挂"在它上面
 # （类比：const app = createApp(App)，或者 Vue Router 里的 router 实例）
@@ -181,6 +262,66 @@ def get_db():
     finally:
         db.close()               # 无论成功还是报错，最后都关闭会话（finally 保证一定执行）
 
+# 校验“这一批角色都真实存在”——多个用户接口都要用，抽成小函数复用
+# 不加这道检查的话，前端传个不存在的 role_id 也能写进中间表，列表里就会显示出“空角色”
+def ensure_roles_exist(db: Session, role_ids: list[int] | None):
+    if not role_ids:      # 没传或空数组都是合法状态（等于不分配/全部取消）
+        return
+    found = {r.id for r in db.query(DBRole).filter(DBRole.id.in_(role_ids)).all()}
+    missing = [rid for rid in role_ids if rid not in found]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"角色不存在：{missing}")
+
+# 全量重写某个用户的角色绑定（先删后插，和角色↔菜单那边同一套思路）
+# 调用前请自己保证已经 commit 过用户本体，且 role_ids 已过校验
+def sync_user_roles(db: Session, user_id: int, role_ids: list[int]):
+    db.query(DBUserRole).filter(DBUserRole.user_id == user_id).delete(synchronize_session=False)
+    for rid in set(role_ids):   # set 去重，防止前端传 [1,1,2] 这种重复项
+        db.add(DBUserRole(user_id=user_id, role_id=rid))
+
+# 把 user_roles 里的关联拼回用户对象上，得到前端要的 role_ids
+# 同样只查 2 次表（users + user_roles）再在 Python 里分组，避开 N+1
+def build_users_with_roles(db: Session) -> list[User]:
+    users = db.query(DBUser).order_by(DBUser.id).all()
+    links = db.query(DBUserRole).all()
+    result = []
+    for u in users:
+        result.append(User(
+            id=u.id, username=u.username, password=u.password, email=u.email,
+            role_ids=sorted(link.role_id for link in links if link.user_id == u.id),
+        ))
+    return result
+
+# 单个用户版的拼装（给 POST/PUT/PATCH 返回用）
+# 不能直接拿上面那个函数取第一条：为了返一条记录把全表查一遍太浪费
+def build_user_with_roles(db: Session, db_user: DBUser) -> User:
+    ids = sorted(
+        link.role_id
+        for link in db.query(DBUserRole).filter(DBUserRole.user_id == db_user.id).all()
+    )
+    return User(
+        id=db_user.id, username=db_user.username,
+        password=db_user.password, email=db_user.email, role_ids=ids,
+    )
+
+# 把“角色 + 已授权菜单”拼成前端要的结构（带 menu_ids / menu_names）
+# 故意只查 3 次表（roles / menus / role_menus）然后在 Python 里分组，
+# 而不是每个角色查一次关联——避免“10 个角色要查 11 次”的 N+1 问题
+def build_roles_with_menus(db: Session) -> list[RoleWithMenus]:
+    roles = db.query(DBRole).order_by(DBRole.id).all()
+    menu_names = {m.id: m.name for m in db.query(DBMenu).all()}
+    links = db.query(DBRoleMenu).all()
+    result = []
+    for r in roles:
+        ids = sorted(link.menu_id for link in links if link.role_id == r.id)
+        result.append(RoleWithMenus(
+            id=r.id, name=r.name, description=r.description,
+            menu_ids=ids,
+            # 过滤一下：万一菜单被删了但残留了关联，拼接时会拼不出名字
+            menu_names=[menu_names[mid] for mid in ids if mid in menu_names],
+        ))
+    return result
+
 # ========== 5. CRUD 接口 增删改查 ==========
 # @app.post / @app.get ... 叫"装饰器"，作用是「注册路由」
 # 类比 Vue Router 里的 { path: '/users', component: ... }
@@ -199,13 +340,19 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
         # HTTPException 相当于前端的 throw new Error + HTTP 状态码
         # 400 = 客户端传的数据有问题；前端 axios 会走 catch 分支，message 在 error.response.data.detail
         raise HTTPException(status_code=400, detail="用户名不能是纯数字")
+    # 选了角色就检查角色是否存在（防脏数据；传空数组就是不给角色，直接跳过）
+    ensure_roles_exist(db, user.role_ids)
 
     # 把前端传来的数据组装成一个数据库对象（还没写入，只是内存里）
+    # 注意 role_ids 不写在这里了 —— 它不是 users 表的列，属于中间表
     db_user = DBUser(username=user.username, password=user.password, email=user.email)
     db.add(db_user)     # 放进会话的"待写入"队列（还没真正存库）
     db.commit()         # 提交事务 —— 真正写进数据库（类似点了"保存"）
-    db.refresh(db_user) # 重新读一次，拿到数据库生成的自增 id 等最新数据
-    return db_user      # 返回给前端（框架自动按 User 模型转成 JSON，带 id）
+    db.refresh(db_user) # 重新读一次，拿到数据库生成的自增 id（写中间表要靠它）
+    # 用户已经有 id 了，才能往 user_roles 里写关联（外键要指向真实存在的用户）
+    sync_user_roles(db, db_user.id, user.role_ids)
+    db.commit()
+    return build_user_with_roles(db, db_user)   # 拼上 role_ids 再返回
 
 # ---- 查询单个用户 GET /users/1 ----
 # 前端 axios: request.get(`/users/${id}`)
@@ -217,31 +364,36 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
     if db_user is None:
         # 404 = 资源不存在，类比前端接口返回的 "Not Found"
         raise HTTPException(status_code=404, detail="用户不存在")
-    return db_user
+    return build_user_with_roles(db, db_user)   # 手工拼 role_ids，否则返回的一直是空数组
 
 # ---- 查询全部用户 GET /users ----
 # 前端 axios: request.get('/users')  （列表页加载时调用）
 @app.get("/users", response_model=list[User])
 def get_all_users(db: Session = Depends(get_db)):
     # .all() 取出表里所有记录（类比数组的 map/filter 都不写条件 = 全量）
-    return db.query(DBUser).all()
+    # 因为 role_ids 在中间表里，不能直接 return 查询结果，得走拼装函数
+    return build_users_with_roles(db)
 
 # ---- 修改用户 PUT /users/1（全量更新）----
-# 前端 axios: request.put(`/users/${id}`, { username, password, email })
-# 注意：PUT 要求把三个字段全传，缺哪个哪个就可能被置空
+# 前端 axios: request.put(`/users/${id}`, { username, password, email, role_ids })
+# 注意：PUT 是全量语义，role_ids 不传会走默认值 []，等于把该用户的角色全部取消
+# （只想改局部请用 PATCH）
 @app.put("/users/{user_id}", response_model=User)
 def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
     # 先找到这条记录，找不到返回 404
     db_user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if db_user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
+    ensure_roles_exist(db, user.role_ids)
     # 用前端传来的新值覆盖旧值（此刻只是内存里改了，数据库还没变）
     db_user.username = user.username
     db_user.password = user.password
     db_user.email = user.email
+    # PUT 是全量语义：传什么就是最终结果，传 [] 就是把这个用户的角色全部取消
+    sync_user_roles(db, user_id, user.role_ids)
     db.commit()         # 提交，真正写库
     db.refresh(db_user) # 拿最新数据
-    return db_user
+    return build_user_with_roles(db, db_user)
 
 # ---- 局部更新 PATCH /users/1（只改传过来的字段）----
 # 前端 axios: request.patch(`/users/${id}`, { email: 'new@qq.com' })
@@ -254,11 +406,20 @@ def patch_user(user_id: int, user: UserUpdate, db: Session = Depends(get_db)):
     # exclude_unset=True：只取"前端真正传了的字段"，没传的不动
     # 类比 TS 里判断 if (data.email !== undefined) 才更新
     update_data = user.model_dump(exclude_unset=True)
+    # 坑：role_ids 不是 users 表的列，不能塞进下面那个 setattr 循环，
+    # 否则 SQLAlchemy 对象上没这个属性，行为不可控。先单独摘出来处理
+    role_ids = update_data.pop("role_ids", None)
+    if role_ids is not None:      # 只有本次真传了才动关联（None = 没传 = 保持原样）
+        ensure_roles_exist(db, role_ids)
     for key, value in update_data.items():
         setattr(db_user, key, value)  # 动态赋值：db_user.email = 新值
+    if role_ids is not None:
+        sync_user_roles(db, user_id, role_ids)
     db.commit()
     db.refresh(db_user)
-    return db_user
+    # 同样不能直接 return db_user：它身上没有 role_ids，
+    # Pydantic 会用默认值补个空数组回去，前端看到的就是“刚设置的角色不见了”
+    return build_user_with_roles(db, db_user)
 
 # ---- 删除用户 DELETE /users/1 ----
 # 前端 axios: request.delete(`/users/${id}`)
@@ -267,6 +428,8 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
     db_user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if db_user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
+    # 先清掉这个用户的角色关联，再删用户本体（顺序反了中间表就会残留脏行）
+    db.query(DBUserRole).filter(DBUserRole.user_id == user_id).delete(synchronize_session=False)
     db.delete(db_user)  # 标记删除
     db.commit()         # 提交，真正从数据库移除
     # 没声明 response_model，直接返回一个字典，框架自动转成 JSON
@@ -350,6 +513,8 @@ def delete_menu(menu_id: int, db: Session = Depends(get_db)):
     db_menu = db.query(DBMenu).filter(DBMenu.id == menu_id).first()
     if db_menu is None:
         raise HTTPException(status_code=404, detail="菜单不存在")
+    # 一并清掉角色对这条菜单的授权：否则 role_menus 里会残留“指向已删菜单”的脏关联
+    db.query(DBRoleMenu).filter(DBRoleMenu.menu_id == menu_id).delete(synchronize_session=False)
     db.delete(db_menu)
     db.commit()
     return {"msg": "删除成功"}
@@ -359,9 +524,10 @@ def delete_menu(menu_id: int, db: Session = Depends(get_db)):
 
 # ---- 查询全部角色 GET /roles ----
 # 前端 axios: request.get('/roles')
-@app.get("/roles", response_model=list[Role])
+# 响应改用 RoleWithMenus：除了角色本身，还带上已授权的菜单，前端一次拿全
+@app.get("/roles", response_model=list[RoleWithMenus])
 def get_all_roles(db: Session = Depends(get_db)):
-    return db.query(DBRole).order_by(DBRole.id).all()
+    return build_roles_with_menus(db)
 
 # ---- 新增角色 POST /roles ----
 # 前端 axios: request.post('/roles', { name, description })
@@ -400,6 +566,33 @@ def delete_role(role_id: int, db: Session = Depends(get_db)):
     db_role = db.query(DBRole).filter(DBRole.id == role_id).first()
     if db_role is None:
         raise HTTPException(status_code=404, detail="角色不存在")
+    # 删角色要同时处理两张中间表的关联，不然会留下“指向不存在角色”的脏引用：
+    # 1) 该角色的菜单授权全部清掉
+    db.query(DBRoleMenu).filter(DBRoleMenu.role_id == role_id).delete(synchronize_session=False)
+    # 2) 用户↔角色关联也清掉：用户本身保留，只是不再拥有这个角色（可能还有其他角色）
+    db.query(DBUserRole).filter(DBUserRole.role_id == role_id).delete(synchronize_session=False)
     db.delete(db_role)
     db.commit()
     return {"msg": "删除成功"}
+
+# ---- 给角色分配可访问菜单 PUT /roles/1/menus ----
+# 前端 axios: request.put(`/roles/${id}/menus`, { menu_ids: [1, 3] })
+# 这就是【角色 ↔ 菜单】绑定的核心接口：写的是中间表 role_menus
+# 采用「全量覆盖」语义：先全部删再按新列表插，比“算出哪些新增、哪些取消”简单得多，也不易错
+@app.put("/roles/{role_id}/menus", response_model=RoleWithMenus)
+def assign_role_menus(role_id: int, data: RoleMenuAssign, db: Session = Depends(get_db)):
+    db_role = db.query(DBRole).filter(DBRole.id == role_id).first()
+    if db_role is None:
+        raise HTTPException(status_code=404, detail="角色不存在")
+    # 校验传入的菜单 id 都真实存在（弹窗开着时另一个页面把菜单删了，这种并发情况要接住）
+    valid_ids = {m.id for m in db.query(DBMenu).all()}
+    invalid = [mid for mid in data.menu_ids if mid not in valid_ids]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"菜单不存在：{invalid}")
+    # 先清空这个角色的原有授权，再写入新的（set 去重，防止前端传重复 id）
+    db.query(DBRoleMenu).filter(DBRoleMenu.role_id == role_id).delete(synchronize_session=False)
+    for mid in set(data.menu_ids):
+        db.add(DBRoleMenu(role_id=role_id, menu_id=mid))
+    db.commit()
+    # 返回带最新授权信息的角色，前端直接用于刷新表格/关弹窗
+    return next(r for r in build_roles_with_menus(db) if r.id == role_id)
