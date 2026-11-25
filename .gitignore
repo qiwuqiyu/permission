@@ -1,0 +1,10 @@
+# Python 运行产物
+__pycache__/
+*.py[cod]
+
+# 本地配置（含数据库密码，绝不入库）；模板见 .env.example
+.env
+
+# 虚拟环境（本机不用，但别人可能建）
+.venv/
+venv/
